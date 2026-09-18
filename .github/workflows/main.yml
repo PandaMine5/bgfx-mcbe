@@ -10,10 +10,12 @@ permissions:
 on:
   workflow_dispatch:
   push:
+    branches: ['**']   # never runs on tag pushes
   pull_request:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: false
 
 jobs:
   build:
@@ -39,20 +41,23 @@ jobs:
           ndk-version: r25c
           add-to-path: false
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: bgfx
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bx
-          path: bx
-          fetch-depth: 0
-      - run: git -C bx checkout 198cd12
+
+      # Blobless clones are much faster than a full fetch and accept short SHAs
+      - name: Fetch bx and bimg
         shell: bash
-      - uses: actions/checkout@v4
+        run: |
+          git clone -q --filter=blob:none https://github.com/bkaradzic/bx bx
+          git -C bx checkout -q 198cd12
+          git clone -q --depth 1 https://github.com/bkaradzic/bimg bimg
+
+      - name: ccache
+        if: matrix.kind == 'linux' || matrix.kind == 'macos'
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          repository: bkaradzic/bimg
-          path: bimg
+          key: ${{ matrix.name }}
 
       # ---------- Windows ----------
       - name: Setup MSYS2
@@ -60,7 +65,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
-          update: true
+          update: false
           install: make
           pacboy: cc:p
       - name: Build (windows)
@@ -79,7 +84,7 @@ jobs:
       - name: Build (linux)
         if: matrix.kind == 'linux'
         run: |
-          sudo apt-get install -y libgl-dev
+          sudo apt-get install -y --no-install-recommends libgl-dev
           cd bgfx
           make -j$(nproc) shaderc \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
@@ -93,7 +98,7 @@ jobs:
         if: matrix.kind == 'macos'
         run: |
           cd bgfx
-          make -j$(sysctl -n hw.physicalcpu) shaderc \
+          make -j$(sysctl -n hw.ncpu) shaderc \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
             CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
             LDFLAGS="-Wl,-dead_strip -flto"
@@ -115,7 +120,7 @@ jobs:
           make -j$(nproc) -R -C .build/projects/gmake-android-${{ matrix.platform }} shaderc config=release \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto=thin -fvisibility=hidden" \
             CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto=thin -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
-            LDFLAGS="-Wl,--gc-sections -Wl,--icf=all -flto=thin -s"
+            LDFLAGS="-Wl,--gc-sections -Wl,--icf=all -flto=thin -fuse-ld=lld -s"
           cp .build/android-${{ matrix.platform }}/bin/libshadercRelease ../shaderc
           $L/bin/llvm-strip --strip-all ../shaderc
 
@@ -126,15 +131,17 @@ jobs:
           F=shaderc
           [ "${{ matrix.kind }}" = windows ] && F=shaderc.exe
           cmake -E tar cf shaderc-${{ matrix.name }}.zip --format=zip "$F"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: shaderc-${{ matrix.name }}
           path: shaderc-${{ matrix.name }}.zip
-      - name: Publish binary
+      - name: Publish to release "Shaderc Binaries"
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           name: Shaderc Binaries
           tag_name: binaries
+          target_commitish: ${{ github.sha }}
+          make_latest: true
           files: shaderc-${{ matrix.name }}.zip
           fail_on_unmatched_files: true

@@ -10,7 +10,7 @@ permissions:
 on:
   workflow_dispatch:
   push:
-    branches: ['**']   # never runs on tag pushes
+    branches: ['**']
   pull_request:
 
 env:
@@ -21,18 +21,54 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+
     strategy:
       fail-fast: false
       matrix:
-        # Enable a platform by uncommenting its line.
         include:
-          # - { name: windows-x64-mingw-gcc,   kind: windows, runner: windows-latest, msystem: MINGW64, bindir: win64_mingw-gcc }
-          # - { name: windows-x64-mingw-clang, kind: windows, runner: windows-latest, msystem: CLANG64, bindir: win64_mingw-clang }
-          # - { name: linux-x64,               kind: linux,   runner: ubuntu-22.04 }
-          # - { name: macos-x64,               kind: macos,   runner: macos-latest }
-          - { name: android-arm32,           kind: android, runner: ubuntu-22.04, platform: arm }
-          # - { name: android-arm64,           kind: android, runner: ubuntu-22.04, platform: arm64 }
+          # - { name: windows-x64-mingw-gcc, kind: windows, runner: windows-latest, msystem: MINGW64, bindir: win64_mingw-gcc }
+          - { name: windows-x64-mingw-clang, kind: windows, runner: windows-latest, msystem: CLANG64, bindir: win64_mingw-clang }
+          - { name: linux-x64, kind: linux, runner: ubuntu-22.04 }
+          - { name: macos-x64, kind: macos, runner: macos-latest }
+          - { name: android-arm32, kind: android, runner: ubuntu-22.04, platform: arm }
+          - { name: android-arm64, kind: android, runner: ubuntu-22.04, platform: arm64 }
+
     steps:
+      # ------------------------------------------------------------
+      # Source checkout
+      # ------------------------------------------------------------
+
+      - name: Checkout bgfx
+        uses: actions/checkout@v5
+        with:
+          path: bgfx
+
+      # ------------------------------------------------------------
+      # Cache bx + bimg
+      # ------------------------------------------------------------
+
+      - name: Restore bx/bimg cache
+        id: deps-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            bx
+            bimg
+          key: ${{ runner.os }}-${{ matrix.kind }}-deps-bx-198cd12-bimg-main-v1
+
+      - name: Fetch bx and bimg
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone -q --filter=blob:none https://github.com/bkaradzic/bx bx
+          git -C bx checkout -q 198cd12
+
+          git clone -q --depth 1 https://github.com/bkaradzic/bimg bimg
+
+      # ------------------------------------------------------------
+      # NDK
+      # ------------------------------------------------------------
+
       - name: Setup NDK
         if: matrix.kind == 'android'
         id: ndk
@@ -41,107 +77,176 @@ jobs:
           ndk-version: r25c
           add-to-path: false
 
-      - uses: actions/checkout@v5
-        with:
-          path: bgfx
+      # ------------------------------------------------------------
+      # ccache
+      # ------------------------------------------------------------
 
-      # Blobless clones are much faster than a full fetch and accept short SHAs
-      - name: Fetch bx and bimg
-        shell: bash
-        run: |
-          git clone -q --filter=blob:none https://github.com/bkaradzic/bx bx
-          git -C bx checkout -q 198cd12
-          git clone -q --depth 1 https://github.com/bkaradzic/bimg bimg
-
-      - name: ccache
-        if: matrix.kind == 'linux' || matrix.kind == 'macos'
+      - name: Setup ccache
+        if: matrix.kind != 'android'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ matrix.name }}
 
-      # ---------- Windows ----------
+      # ------------------------------------------------------------
+      # Windows
+      # ------------------------------------------------------------
+
       - name: Setup MSYS2
         if: matrix.kind == 'windows'
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
           update: false
-          install: make
+          install: make ccache
           pacboy: cc:p
+
       - name: Build (windows)
         if: matrix.kind == 'windows'
         shell: msys2 {0}
         run: |
           cd bgfx
-          make shaderc -j$(nproc) AR=ar CC=cc CXX=c++ MINGW=$MINGW_PREFIX \
+
+          make shaderc -j$(nproc) \
+            AR=ar \
+            CC="ccache cc" \
+            CXX="ccache c++" \
+            MINGW=$MINGW_PREFIX \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
             CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
             LDFLAGS="-Wl,--gc-sections -flto -static -static-libgcc -static-libstdc++ -s"
+
           cp .build/${{ matrix.bindir }}/bin/shadercRelease.exe ../shaderc.exe
           strip --strip-all ../shaderc.exe
 
-      # ---------- Linux ----------
+      # ------------------------------------------------------------
+      # Linux
+      # ------------------------------------------------------------
+
+      - name: Install Linux dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl-dev
+
       - name: Build (linux)
         if: matrix.kind == 'linux'
         run: |
-          sudo apt-get install -y --no-install-recommends libgl-dev
           cd bgfx
+
           make -j$(nproc) shaderc \
+            CC="ccache gcc" \
+            CXX="ccache g++" \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
             CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
             LDFLAGS="-Wl,--gc-sections -flto -s"
+
           cp .build/linux64_gcc/bin/shadercRelease ../shaderc
           strip --strip-all ../shaderc
 
-      # ---------- macOS ----------
+      # ------------------------------------------------------------
+      # macOS
+      # ------------------------------------------------------------
+
       - name: Build (macos)
         if: matrix.kind == 'macos'
         run: |
           cd bgfx
+
           make -j$(sysctl -n hw.ncpu) shaderc \
+            CC="ccache clang" \
+            CXX="ccache clang++" \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
             CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
             LDFLAGS="-Wl,-dead_strip -flto"
+
           cp .build/osx-x64/bin/shadercRelease ../shaderc
           strip -x ../shaderc
 
-      # ---------- Android ----------
+      # ------------------------------------------------------------
+      # Android
+      # ------------------------------------------------------------
+
       - name: Build (android)
         if: matrix.kind == 'android'
         env:
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           L=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64
+
           # NDK r25c lacks libpthread; create empty stubs
           ar -cr $L/sysroot/usr/lib/aarch64-linux-android/libpthread.a
           ar -cr $L/sysroot/usr/lib/arm-linux-androideabi/libpthread.a
+
           cd bgfx
+
           make .build/projects/gmake-android-${{ matrix.platform }}
-          make -j$(nproc) -R -C .build/projects/gmake-android-${{ matrix.platform }} shaderc config=release \
+
+          make -j$(nproc) \
+            -R \
+            -C .build/projects/gmake-android-${{ matrix.platform }} \
+            shaderc \
+            config=release \
             CFLAGS="-Os -ffunction-sections -fdata-sections -flto=thin -fvisibility=hidden" \
             CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto=thin -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
             LDFLAGS="-Wl,--gc-sections -Wl,--icf=all -flto=thin -fuse-ld=lld -s"
+
           cp .build/android-${{ matrix.platform }}/bin/libshadercRelease ../shaderc
           $L/bin/llvm-strip --strip-all ../shaderc
 
-      # ---------- Package & publish ----------
+      # ------------------------------------------------------------
+      # Package
+      # ------------------------------------------------------------
+
       - name: Zip binary
         shell: bash
         run: |
           F=shaderc
           [ "${{ matrix.kind }}" = windows ] && F=shaderc.exe
-          cmake -E tar cf shaderc-${{ matrix.name }}.zip --format=zip "$F"
-      - uses: actions/upload-artifact@v5
+
+          cmake -E tar cf \
+            shaderc-${{ matrix.name }}.zip \
+            --format=zip \
+            "$F"
+
+      # ------------------------------------------------------------
+      # Upload artifact for release job
+      # ------------------------------------------------------------
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v6
         with:
           name: shaderc-${{ matrix.name }}
           path: shaderc-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  # ==================================================================
+  # One release job, after ALL matrix builds have completed
+  # ==================================================================
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: shaderc-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show release assets
+        run: |
+          find release-assets -type f -maxdepth 2 -print
+
       - name: Publish to release "Shaderc Binaries"
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           name: Shaderc Binaries
           tag_name: binaries
           target_commitish: ${{ github.sha }}
           make_latest: true
-          files: shaderc-${{ matrix.name }}.zip
+          files: release-assets/*.zip
           fail_on_unmatched_files: true

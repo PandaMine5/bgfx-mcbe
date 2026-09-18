@@ -10,23 +10,35 @@ permissions:
 on:
   workflow_dispatch:
   push:
-    branches: [main]
   pull_request:
 
 env:
-  PUBLISH: ${{ github.event_name != 'pull_request' }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  mingw:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        # Enable a platform by uncommenting its line.
         include:
-          - { msystem: MINGW64, project: mingw-gcc, bindir: win64_mingw-gcc }
-          # - { msystem: CLANG64, project: mingw-clang, bindir: win64_mingw-clang }
-    name: windows-${{ matrix.project }}
-    runs-on: windows-latest
+          # - { name: windows-x64-mingw-gcc,   kind: windows, runner: windows-latest, msystem: MINGW64, bindir: win64_mingw-gcc }
+          # - { name: windows-x64-mingw-clang, kind: windows, runner: windows-latest, msystem: CLANG64, bindir: win64_mingw-clang }
+          # - { name: linux-x64,               kind: linux,   runner: ubuntu-22.04 }
+          # - { name: macos-x64,               kind: macos,   runner: macos-latest }
+          - { name: android-arm32,           kind: android, runner: ubuntu-22.04, platform: arm }
+          # - { name: android-arm64,           kind: android, runner: ubuntu-22.04, platform: arm64 }
     steps:
+      - name: Setup NDK
+        if: matrix.kind == 'android'
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: false
+
       - uses: actions/checkout@v4
         with:
           path: bgfx
@@ -41,160 +53,88 @@ jobs:
         with:
           repository: bkaradzic/bimg
           path: bimg
-      - uses: msys2/setup-msys2@v2
+
+      # ---------- Windows ----------
+      - name: Setup MSYS2
+        if: matrix.kind == 'windows'
+        uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
           update: true
           install: make
           pacboy: cc:p
-      - name: Build
+      - name: Build (windows)
+        if: matrix.kind == 'windows'
         shell: msys2 {0}
         run: |
           cd bgfx
-          make shaderc -j$(nproc) AR=ar CC=cc CXX=c++ MINGW=$MINGW_PREFIX
-      - name: Rename binary
-        shell: bash
-        run: cp bgfx/.build/${{ matrix.bindir }}/bin/shadercRelease.exe shaderc.exe
-      - uses: actions/upload-artifact@v4
-        with:
-          name: shaderc-windows-x64-${{ matrix.project }}
-          path: shaderc.exe
-      - name: Zip binary
-        run: Compress-Archive -Path shaderc.exe -Destination shaderc-windows-x64-${{ matrix.project }}.zip
-      - name: Publish binary
-        if: env.PUBLISH == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: shaderc-windows-x64-${{ matrix.project }}.zip
-          tag_name: binaries
-          fail_on_unmatched_files: true
+          make shaderc -j$(nproc) AR=ar CC=cc CXX=c++ MINGW=$MINGW_PREFIX \
+            CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
+            CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
+            LDFLAGS="-Wl,--gc-sections -flto -static -static-libgcc -static-libstdc++ -s"
+          cp .build/${{ matrix.bindir }}/bin/shadercRelease.exe ../shaderc.exe
+          strip --strip-all ../shaderc.exe
 
-  linux:
-    name: linux-x64
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: bgfx
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bx
-          path: bx
-          fetch-depth: 0
-      - run: git -C bx checkout 198cd12
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bimg
-          path: bimg
-      - name: Build
+      # ---------- Linux ----------
+      - name: Build (linux)
+        if: matrix.kind == 'linux'
         run: |
           sudo apt-get install -y libgl-dev
           cd bgfx
-          make -j$(nproc) shaderc
-      - name: Rename binary
-        run: cp bgfx/.build/linux64_gcc/bin/shadercRelease shaderc
-      - uses: actions/upload-artifact@v4
-        with:
-          name: shaderc-linux-x64
-          path: shaderc
-      - name: Zip binary
-        run: zip shaderc-linux-x64.zip shaderc
-      - name: Publish binary
-        if: env.PUBLISH == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: shaderc-linux-x64.zip
-          tag_name: binaries
-          fail_on_unmatched_files: true
+          make -j$(nproc) shaderc \
+            CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
+            CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
+            LDFLAGS="-Wl,--gc-sections -flto -s"
+          cp .build/linux64_gcc/bin/shadercRelease ../shaderc
+          strip --strip-all ../shaderc
 
-  macos:
-    name: macos-x64
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: bgfx
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bx
-          path: bx
-          fetch-depth: 0
-      - run: git -C bx checkout 198cd12
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bimg
-          path: bimg
-      - name: Build
+      # ---------- macOS ----------
+      - name: Build (macos)
+        if: matrix.kind == 'macos'
         run: |
           cd bgfx
-          make -j$(sysctl -n hw.physicalcpu) shaderc
-      - name: Rename binary
-        run: cp bgfx/.build/osx-x64/bin/shadercRelease shaderc
-      - uses: actions/upload-artifact@v4
-        with:
-          name: shaderc-macos-x64
-          path: shaderc
-      - name: Zip binary
-        run: zip shaderc-macos-x64.zip shaderc
-      - name: Publish binary
-        if: env.PUBLISH == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: shaderc-macos-x64.zip
-          tag_name: binaries
-          fail_on_unmatched_files: true
+          make -j$(sysctl -n hw.physicalcpu) shaderc \
+            CFLAGS="-Os -ffunction-sections -fdata-sections -flto -fvisibility=hidden" \
+            CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
+            LDFLAGS="-Wl,-dead_strip -flto"
+          cp .build/osx-x64/bin/shadercRelease ../shaderc
+          strip -x ../shaderc
 
-  android:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { platform: arm, label: arm32 }
-          - { platform: arm64, label: arm64 }
-    name: android-${{ matrix.label }}
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r25c
-          add-to-path: false
-      - uses: actions/checkout@v4
-        with:
-          path: bgfx
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bx
-          path: bx
-          fetch-depth: 0
-      - run: git -C bx checkout 198cd12
-      - uses: actions/checkout@v4
-        with:
-          repository: bkaradzic/bimg
-          path: bimg
-      - name: Build
+      # ---------- Android ----------
+      - name: Build (android)
+        if: matrix.kind == 'android'
         env:
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          sudo apt-get install -y libgl-dev
+          L=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64
           # NDK r25c lacks libpthread; create empty stubs
-          ar -cr $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libpthread.a
-          ar -cr $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libpthread.a
+          ar -cr $L/sysroot/usr/lib/aarch64-linux-android/libpthread.a
+          ar -cr $L/sysroot/usr/lib/arm-linux-androideabi/libpthread.a
           cd bgfx
           make .build/projects/gmake-android-${{ matrix.platform }}
-          make -j$(nproc) -R -C .build/projects/gmake-android-${{ matrix.platform }} shaderc config=release
-      - name: Rename binary
-        run: cp bgfx/.build/android-${{ matrix.platform }}/bin/libshadercRelease shaderc
+          make -j$(nproc) -R -C .build/projects/gmake-android-${{ matrix.platform }} shaderc config=release \
+            CFLAGS="-Os -ffunction-sections -fdata-sections -flto=thin -fvisibility=hidden" \
+            CXXFLAGS="-Os -ffunction-sections -fdata-sections -flto=thin -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden" \
+            LDFLAGS="-Wl,--gc-sections -Wl,--icf=all -flto=thin -s"
+          cp .build/android-${{ matrix.platform }}/bin/libshadercRelease ../shaderc
+          $L/bin/llvm-strip --strip-all ../shaderc
+
+      # ---------- Package & publish ----------
+      - name: Zip binary
+        shell: bash
+        run: |
+          F=shaderc
+          [ "${{ matrix.kind }}" = windows ] && F=shaderc.exe
+          cmake -E tar cf shaderc-${{ matrix.name }}.zip --format=zip "$F"
       - uses: actions/upload-artifact@v4
         with:
-          name: shaderc-android-${{ matrix.label }}
-          path: shaderc
-      - name: Zip binary
-        run: zip shaderc-android-${{ matrix.label }}.zip shaderc
+          name: shaderc-${{ matrix.name }}
+          path: shaderc-${{ matrix.name }}.zip
       - name: Publish binary
-        if: env.PUBLISH == 'true'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          files: shaderc-android-${{ matrix.label }}.zip
+          name: Shaderc Binaries
           tag_name: binaries
+          files: shaderc-${{ matrix.name }}.zip
           fail_on_unmatched_files: true
